@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video Compressor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="panel">
+        <h1>Video Compressor</h1>
+        <p class="subtitle">
+          Upload any video file, any size, any format.<br />
+          Get a compressed version (70 %+ smaller) without visible quality loss.
+        </p>
+
+        <div id="drop-zone" class="drop-zone">
+          <p class="drop-icon">&#128193;</p>
+          <p>Drag &amp; drop your video here</p>
+          <p class="small">or click to browse &mdash; all formats accepted</p>
+          <input id="video" type="file" accept="video/*" />
+        </div>
+
+        <div id="file-info" class="file-info hidden">
+          <span id="file-name" class="file-name"></span>
+          <span id="file-size" class="file-size"></span>
+        </div>
+
+        <button id="submit-btn" disabled>Compress &amp; Download</button>
+
+        <div id="progress-section" class="progress-section hidden">
+          <div class="progress-bar-bg">
+            <div id="progress-bar" class="progress-bar"></div>
+          </div>
+          <p id="progress-text" class="progress-text">Preparing&hellip;</p>
+        </div>
+
+        <div id="stats" class="stats hidden">
+          <div class="stat">
+            <span class="stat-label">Original</span>
+            <span id="stat-original" class="stat-value"></span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Compressed</span>
+            <span id="stat-compressed" class="stat-value"></span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Reduction</span>
+            <span id="stat-reduction" class="stat-value highlight"></span>
+          </div>
+        </div>
+
+        <div id="error-box" class="alert error hidden"></div>
+      </section>
+    </main>
+
+    <script>
+      /* ---- DOM refs ---- */
+      var dropZone = document.getElementById("drop-zone");
+      var fileInput = document.getElementById("video");
+      var fileInfo = document.getElementById("file-info");
+      var fileName = document.getElementById("file-name");
+      var fileSizeEl = document.getElementById("file-size");
+      var submitBtn = document.getElementById("submit-btn");
+      var progressSection = document.getElementById("progress-section");
+      var progressBar = document.getElementById("progress-bar");
+      var progressText = document.getElementById("progress-text");
+      var statsDiv = document.getElementById("stats");
+      var errorBox = document.getElementById("error-box");
+
+      var CHUNK = 4 * 1024 * 1024; // 4 MB per chunk
+
+      /* ---- helpers ---- */
+      function fmt(b) {
+        if (b < 1024) return b + " B";
+        if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+        if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+        return (b / 1073741824).toFixed(2) + " GB";
+      }
+      function fmtTime(s) {
+        if (s < 60) return Math.ceil(s) + "s";
+        var m = Math.floor(s / 60), sec = Math.ceil(s % 60);
+        return m + "m " + sec + "s";
+      }
+
+      function showFile(f) {
+        fileName.textContent = f.name;
+        fileSizeEl.textContent = fmt(f.size);
+        fileInfo.classList.remove("hidden");
+        submitBtn.disabled = false;
+        statsDiv.classList.add("hidden");
+        errorBox.classList.add("hidden");
+      }
+      function showError(msg) {
+        errorBox.textContent = msg;
+        errorBox.classList.remove("hidden");
+      }
+      function resetUI() {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Compress & Download";
+        progressSection.classList.add("hidden");
+        progressBar.style.width = "0%";
+        progressBar.classList.remove("indeterminate");
+      }
+
+      /* ---- drag & drop ---- */
+      ["dragenter", "dragover"].forEach(function (e) {
+        dropZone.addEventListener(e, function (ev) { ev.preventDefault(); dropZone.classList.add("dragover"); });
+      });
+      ["dragleave", "drop"].forEach(function (e) {
+        dropZone.addEventListener(e, function (ev) { ev.preventDefault(); dropZone.classList.remove("dragover"); });
+      });
+      dropZone.addEventListener("drop", function (e) {
+        if (e.dataTransfer.files[0]) { fileInput.files = e.dataTransfer.files; showFile(e.dataTransfer.files[0]); }
+      });
+      fileInput.addEventListener("change", function () { if (fileInput.files[0]) showFile(fileInput.files[0]); });
+
+      /* ---- network helpers ---- */
+      function jsonReq(method, url, body) {
+        return new Promise(function (ok, fail) {
+          var xhr = new XMLHttpRequest();
+          xhr.open(method, url);
+          xhr.timeout = 0;
+          if (body !== undefined) xhr.setRequestHeader("Content-Type", "application/json");
+          xhr.onload = function () {
+            try { var d = JSON.parse(xhr.responseText); ok(d); }
+            catch (_) { fail({ error: "Invalid response from server (status " + xhr.status + ")." }); }
+          };
+          xhr.onerror = function () { fail({ error: "Network error." }); };
+          xhr.send(body !== undefined ? JSON.stringify(body) : null);
+        });
+      }
+
+      function uploadChunk(url, blob) {
+        return new Promise(function (ok, fail) {
+          var fd = new FormData();
+          fd.append("chunk", blob);
+          var xhr = new XMLHttpRequest();
+          xhr.open("POST", url);
+          xhr.timeout = 60000;
+          xhr.onload = function () {
+            try {
+              var d = JSON.parse(xhr.responseText);
+              if (xhr.status >= 200 && xhr.status < 300) ok(d);
+              else fail(d);
+            } catch (_) { fail({ error: "Chunk failed (" + xhr.status + ")" }); }
+          };
+          xhr.onerror = function () { fail({ error: "Network error on chunk." }); };
+          xhr.ontimeout = function () { fail({ error: "Chunk upload timed out." }); };
+          xhr.send(fd);
+        });
+      }
+
+      /* ---- main flow ---- */
+      submitBtn.addEventListener("click", async function () {
+        var file = fileInput.files[0];
+        if (!file) return;
+
+        errorBox.classList.add("hidden");
+        statsDiv.classList.add("hidden");
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Processing\u2026";
+        progressSection.classList.remove("hidden");
+        progressBar.style.width = "0%";
+        progressText.textContent = "Starting upload\u2026";
+
+        try {
+          /* 1. register upload */
+          var start = await jsonReq("POST", "/upload/start", {
+            filename: file.name, totalSize: file.size
+          });
+          if (start.error) { showError(start.error); resetUI(); return; }
+          var uid = start.upload_id;
+
+          /* 2. sequential chunked upload with speed & ETA */
+          var totalChunks = Math.ceil(file.size / CHUNK);
+          var sent = 0;
+          var t0 = Date.now();
+
+          for (var i = 0; i < totalChunks; i++) {
+            var off = i * CHUNK;
+            var blob = file.slice(off, Math.min(off + CHUNK, file.size));
+            var retries = 3;
+            var ok = false;
+            while (retries > 0 && !ok) {
+              try {
+                var res = await uploadChunk("/upload/chunk/" + uid, blob);
+                if (res.error) throw res;
+                ok = true;
+              } catch (e) {
+                retries--;
+                if (retries <= 0) { showError(e.error || "Upload failed after retries."); resetUI(); return; }
+                await new Promise(function (r) { setTimeout(r, 1000); });
+              }
+            }
+            sent += blob.size;
+            var pct = Math.min(Math.round((sent / file.size) * 100), 100);
+            progressBar.style.width = pct + "%";
+            var elapsed = (Date.now() - t0) / 1000;
+            var speed = sent / (elapsed || 1);
+            var remaining = (file.size - sent) / (speed || 1);
+            progressText.textContent =
+              "Uploading\u2026 " + pct + "%  |  " +
+              fmt(speed) + "/s  |  ETA " + fmtTime(remaining);
+          }
+
+          /* 3. start compression (returns immediately) */
+          progressBar.style.width = "100%";
+          progressBar.classList.add("indeterminate");
+          progressText.textContent = "Starting compression\u2026";
+
+          var compStart = await jsonReq("POST", "/upload/complete/" + uid);
+          if (compStart.error) { showError(compStart.error); resetUI(); return; }
+
+          /* 4. poll /status until done */
+          var compT0 = Date.now();
+          while (true) {
+            await new Promise(function (r) { setTimeout(r, 2000); });
+            var st;
+            try { st = await jsonReq("GET", "/status/" + uid); }
+            catch (_) { continue; /* network blip, retry */ }
+
+            var compElapsed = Math.round((Date.now() - compT0) / 1000);
+            progressText.textContent =
+              "Compressing video\u2026 " + fmtTime(compElapsed) + " elapsed";
+
+            if (st.status === "done") {
+              if (st.stats) {
+                document.getElementById("stat-original").textContent = st.stats.input_size_mb + " MB";
+                document.getElementById("stat-compressed").textContent = st.stats.output_size_mb + " MB";
+                document.getElementById("stat-reduction").textContent = st.stats.reduction_percent + "%";
+                statsDiv.classList.remove("hidden");
+              }
+              progressText.textContent = "Done! Starting download\u2026";
+              progressBar.classList.remove("indeterminate");
+              window.location.href = "/download/" + st.download_id;
+              break;
+            } else if (st.status === "error") {
+              showError(st.error || "Compression failed.");
+              break;
+            }
+            /* else status === "compressing" — keep polling */
+          }
+
+        } catch (err) {
+          showError(err.error || err.message || "An unexpected error occurred.");
+        }
+        resetUI();
+      });
+    </script>
+  </body>
+</html>
