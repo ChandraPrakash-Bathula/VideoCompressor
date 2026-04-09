@@ -243,23 +243,18 @@ class VideoCompressor:
         self,
         input_path: str,
         output_path: str,
-        target_size_mb: float = 25.0,
+        target_reduction: int = 70,
     ) -> Optional[Dict]:
         """
-        Compress any video to a target file size while preserving quality.
+        Single-pass CRF compression that targets a specific file-size reduction
+        while preserving visual quality.  Accepts ANY format FFmpeg can read.
 
-        Strategy:
-        - If file is already under target size, copy it (no re-encode).
-        - Calculates exact bitrate from target size and duration.
-        - Keeps original resolution when bitrate allows it.
-        - Scales down only when necessary to avoid blocky output.
-        - Uses 'veryfast' preset for speed.
-        - Single-pass with constrained bitrate for accurate file sizes.
+        Uses CRF with maxrate capping to achieve the target size in one fast pass.
 
         Args:
-            input_path:     Path to input video (any format FFmpeg can read)
-            output_path:    Path to output video (.mp4)
-            target_size_mb: Target output file size in megabytes (default: 25)
+            input_path:       Path to input video (any format)
+            output_path:      Path to output video (.mp4)
+            target_reduction: Target size reduction percentage (default: 70)
 
         Returns:
             dict with compression stats on success, None on failure
@@ -272,37 +267,6 @@ class VideoCompressor:
         if input_size == 0:
             logger.error("Input file is empty")
             return None
-
-        target_bytes = int(target_size_mb * 1024 * 1024)
-
-        # Already small enough — just remux, no quality loss at all
-        if input_size <= target_bytes:
-            logger.info(
-                f"File is already {input_size / (1024*1024):.1f} MB "
-                f"(<= {target_size_mb} MB). Remuxing to MP4."
-            )
-            try:
-                cmd = [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-c", "copy", "-movflags", "+faststart", output_path,
-                ]
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                if r.returncode != 0:
-                    logger.error(f"Remux failed:\n{r.stderr[-500:]}")
-                    return None
-                output_size = os.path.getsize(output_path)
-                return {
-                    "input_size": input_size,
-                    "output_size": output_size,
-                    "reduction_percent": round(
-                        max(0, (input_size - output_size) / input_size * 100), 1
-                    ),
-                    "input_size_mb": round(input_size / (1024 * 1024), 2),
-                    "output_size_mb": round(output_size / (1024 * 1024), 2),
-                }
-            except Exception as e:
-                logger.error(f"Remux error: {e}")
-                return None
 
         # ---- probe ----
         info = self.get_video_info(input_path)
@@ -334,63 +298,69 @@ class VideoCompressor:
             logger.error("Cannot determine video resolution")
             return None
 
-        # ---- calculate target bitrate ----
-        # Reserve 5% overhead for container + muxing
-        usable_bytes = int(target_bytes * 0.95)
-        audio_bps = 96_000 if audio_stream else 0  # 96k AAC is transparent
-        total_bps = int(usable_bytes * 8 / duration)
-        video_bps = max(total_bps - audio_bps, 100_000)
+        # ---- figure out current bitrate & target ----
+        current_bps = int(input_size * 8 / duration)
+        target_size = input_size * (1 - target_reduction / 100.0)
+        target_total_bps = int((target_size * 8) / duration)
 
-        # ---- smart resolution scaling (only when needed) ----
-        vbr_kbps = video_bps / 1000
+        audio_bps = 128_000 if audio_stream else 0
+        target_video_bps = max(target_total_bps - audio_bps, 200_000)
+
+        # ---- determine CRF from target ratio ----
+        ratio = target_video_bps / max(current_bps, 1)
+        if ratio >= 0.6:
+            crf = 23
+        elif ratio >= 0.3:
+            crf = 28
+        elif ratio >= 0.15:
+            crf = 32
+        else:
+            crf = 36
+
+        # ---- smart resolution scaling ----
+        vbr_kbps = target_video_bps / 1000
         out_h = height
-        if vbr_kbps < 1500 and out_h > 1080:
+        if vbr_kbps < 2000 and out_h > 1080:
             out_h = 1080
-        if vbr_kbps < 800 and out_h > 720:
+        if vbr_kbps < 1000 and out_h > 720:
             out_h = 720
-        if vbr_kbps < 400 and out_h > 480:
+        if vbr_kbps < 500 and out_h > 480:
             out_h = 480
-        if vbr_kbps < 200 and out_h > 360:
-            out_h = 360
 
+        # video filter – always ensure even dimensions for libx264
         if out_h < height:
             vf = f"scale=-2:{out_h}"
         else:
             vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
-        vbr_str = f"{video_bps // 1000}k"
-        maxrate_str = f"{video_bps // 1000}k"
-        bufsize_str = f"{video_bps // 500}k"   # 2× target for VBV buffer
+        maxrate = f"{int(target_video_bps * 1.5) // 1000}k"
+        bufsize = f"{target_video_bps * 2 // 1000}k"
 
         logger.info(
             f"Input : {width}x{height}, {duration:.1f}s, "
             f"{input_size / (1024 * 1024):.1f} MB"
         )
-        target_h_label = f"{out_h}p" if out_h < height else f"{height}p (kept)"
         logger.info(
-            f"Target: {target_size_mb} MB, video {vbr_str}, "
-            f"audio {'96k' if audio_stream else 'none'}, res {target_h_label}"
+            f"Target: {target_size / (1024 * 1024):.1f} MB "
+            f"({target_reduction}% reduction), CRF {crf}, maxrate {maxrate}"
         )
 
         try:
+            # ---- single-pass encode ----
             cmd = [
                 "ffmpeg", "-y",
                 "-i", input_path,
                 "-map", "0:v:0",
                 "-c:v", "libx264",
-                "-b:v", vbr_str,
-                "-maxrate", maxrate_str,
-                "-bufsize", bufsize_str,
-                "-preset", "veryfast",
+                "-crf", str(crf),
+                "-maxrate", maxrate,
+                "-bufsize", bufsize,
+                "-preset", "fast",
                 "-pix_fmt", "yuv420p",
                 "-vf", vf,
             ]
             if audio_stream:
-                cmd.extend([
-                    "-map", "0:a:0",
-                    "-c:a", "aac",
-                    "-b:a", "96k",
-                ])
+                cmd.extend(["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"])
             else:
                 cmd.append("-an")
             cmd.extend(["-movflags", "+faststart", output_path])
