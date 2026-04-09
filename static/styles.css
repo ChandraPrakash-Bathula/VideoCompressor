@@ -111,6 +111,38 @@ h1 {
   white-space: nowrap;
 }
 
+/* ---- target size ---- */
+.target-row {
+  margin-top: 14px;
+}
+
+.field-label {
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: block;
+  margin-bottom: 6px;
+}
+
+.target-input-wrap {
+  display: flex;
+  gap: 8px;
+}
+
+.target-input-wrap select,
+.target-input-wrap input {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-light);
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.target-input-wrap input {
+  max-width: 100px;
+}
+
 /* ---- button ---- */
 button {
   width: 100%;

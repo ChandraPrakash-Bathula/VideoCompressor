@@ -40,6 +40,7 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         filename = secure_filename(data.get("filename", ""))
         total_size = data.get("totalSize", 0)
+        target_mb = data.get("targetMB", 25)
 
         if not filename:
             return jsonify(error="Invalid filename."), 400
@@ -54,6 +55,7 @@ def create_app() -> Flask:
             "path": str(dest),
             "filename": filename,
             "total_size": int(total_size),
+            "target_mb": target_mb,
             "received": 0,
         }
         return jsonify(upload_id=upload_id)
@@ -95,10 +97,16 @@ def create_app() -> Flask:
         def run_compress():
             temp_output = OUTPUT_DIR / f"{upload_id}_compressed.mp4"
             try:
+                target_mb = float(info.get("target_mb", 25))
+                if target_mb < 1:
+                    target_mb = 1
+                if target_mb > 10000:
+                    target_mb = 10000
+
                 stats = compressor.smart_compress(
                     input_path=str(temp_input),
                     output_path=str(temp_output),
-                    target_reduction=75,
+                    target_size_mb=target_mb,
                 )
                 if stats is None or not temp_output.exists():
                     temp_input.unlink(missing_ok=True)

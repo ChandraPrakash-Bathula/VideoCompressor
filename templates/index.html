@@ -12,7 +12,7 @@
         <h1>Video Compressor</h1>
         <p class="subtitle">
           Upload any video file, any size, any format.<br />
-          Get a compressed version (70 %+ smaller) without visible quality loss.
+          Compress it to your target size &mdash; quality preserved automatically.
         </p>
 
         <div id="drop-zone" class="drop-zone">
@@ -25,6 +25,21 @@
         <div id="file-info" class="file-info hidden">
           <span id="file-name" class="file-name"></span>
           <span id="file-size" class="file-size"></span>
+        </div>
+
+        <div class="target-row">
+          <label class="field-label" for="target-size">Target Size</label>
+          <div class="target-input-wrap">
+            <select id="target-size">
+              <option value="8">8 MB (Discord free)</option>
+              <option value="10">10 MB</option>
+              <option value="25" selected>25 MB (Email / WhatsApp)</option>
+              <option value="50">50 MB</option>
+              <option value="100">100 MB</option>
+              <option value="custom">Custom&hellip;</option>
+            </select>
+            <input id="custom-size" type="number" min="1" max="10000" placeholder="MB" class="hidden" />
+          </div>
         </div>
 
         <button id="submit-btn" disabled>Compress &amp; Download</button>
@@ -70,6 +85,26 @@
       var errorBox = document.getElementById("error-box");
 
       var CHUNK = 4 * 1024 * 1024; // 4 MB per chunk
+
+      var targetSelect = document.getElementById("target-size");
+      var customInput = document.getElementById("custom-size");
+
+      targetSelect.addEventListener("change", function () {
+        if (targetSelect.value === "custom") {
+          customInput.classList.remove("hidden");
+          customInput.focus();
+        } else {
+          customInput.classList.add("hidden");
+        }
+      });
+
+      function getTargetMB() {
+        if (targetSelect.value === "custom") {
+          var v = parseFloat(customInput.value);
+          return (v && v >= 1) ? v : 25;
+        }
+        return parseFloat(targetSelect.value);
+      }
 
       /* ---- helpers ---- */
       function fmt(b) {
@@ -167,8 +202,9 @@
 
         try {
           /* 1. register upload */
+          var targetMB = getTargetMB();
           var start = await jsonReq("POST", "/upload/start", {
-            filename: file.name, totalSize: file.size
+            filename: file.name, totalSize: file.size, targetMB: targetMB
           });
           if (start.error) { showError(start.error); resetUI(); return; }
           var uid = start.upload_id;
